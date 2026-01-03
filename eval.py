@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import gymnasium as gym
 import numpy as np
+from gymnasium import spaces
 import torch as th
 from pettingzoo.utils import parallel_to_aec
 from stable_baselines3 import PPO
