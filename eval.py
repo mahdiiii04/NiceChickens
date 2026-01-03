@@ -53,14 +53,9 @@ class NiceChickensWrapper(gym.Env):
         self.paired_actions = []
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-            self.env.reset(seed=seed)
-        else:
-            self.env.reset()
+        observations, infos = self.env.reset(seed=seed)
         self.agents = self.env.agents
-        self.paired_actions = []
-        observations, infos = self.env.reset() if seed is None else self.env.reset(seed=seed)
-        # reset returns obs, info — but in your code it's already handled
+        self.paired_actions = []  # <-- Critical: reset here!
         return self._get_concat_obs(observations), infos
 
     def step(self, actions):  # actions: np.array of shape (num_agents,)
@@ -90,21 +85,27 @@ class NiceChickensWrapper(gym.Env):
 class MetricsCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.metrics_log = []
+        self.paired_actions_history = []  # We'll collect across episodes
+        self.env_ref = None  # Will store reference to our wrapped env
 
-    def _on_step(self) -> bool:
-        return True
+    def _on_training_start(self) -> None:
+        # Grab the environment once at the start of training
+        self.env_ref = self.training_env.envs[0]  # This is our NiceChickensWrapper
 
     def _on_rollout_end(self) -> None:
-        # Extract info from last episode(s) - SB3 VecEnv stores infos in self.locals['infos']
-        infos = self.locals.get("infos", [{}])
-        info = infos[-1] if infos else {}
+        if self.env_ref is None:
+            return
 
-        env = self.training_env.envs[0].env.env  # unwrap to our wrapper
+        # Access the original NiceChickens env
+        env = self.env_ref.env  # → NiceChickens instance
 
-        final_scores = list(env.env.scores.values())
-        coop_rate = (sum(a == 0 for a in env.paired_actions) / len(env.paired_actions)) if env.paired_actions else 0.0
+        final_scores = list(env.scores.values())
 
+        # Get paired actions from the wrapper (we stored them there)
+        paired_actions = self.env_ref.paired_actions if hasattr(self.env_ref, 'paired_actions') else []
+        coop_rate = (sum(a == 0 for a in paired_actions) / len(paired_actions)) if paired_actions else 0.0
+
+        # Gini coefficient
         scores_sorted = sorted(final_scores)
         n = len(scores_sorted)
         if n > 0 and sum(scores_sorted) > 0:
@@ -114,32 +115,27 @@ class MetricsCallback(BaseCallback):
             gini = 0.0
 
         max_score = max(final_scores) if final_scores else 0.0
-        num_winners = sum(1 for s in final_scores if s >= env.env.smax)
+        num_winners = sum(1 for s in final_scores if s >= env.smax)
         tie = 1 if num_winners > 1 else 0
 
-        metrics = {
-            "episode_reward_mean": self.logger.name_to_value.get("train/episode_reward", 0.0),
-            "episode_len": self.num_timesteps,  # approximate
-            "cooperation_rate": coop_rate,
-            "final_gini": gini,
-            "winner_score": max_score,
-            "num_winners": num_winners,
-            "tie": tie,
-        }
+        print(f"\n=== Rollout Metrics ===")
+        print(f"Cooperation rate: {coop_rate:.3f}")
+        print(f"Gini coefficient: {gini:.3f}")
+        print(f"Max score: {max_score:.1f}")
+        print(f"Num winners: {num_winners} | Tie: {tie}")
+        print(f"Episode reward mean (approx): {self.logger.name_to_value.get('train/episode_reward', 0):.2f}")
+        print("="*30)
 
-        self.metrics_log.append(metrics)
-
-        print(f"Rollout end | "
-              f"Reward: {metrics['episode_reward_mean']:.2f} | "
-              f"Coop rate: {coop_rate:.3f} | "
-              f"Gini: {gini:.3f} | "
-              f"Winner score: {max_score:.1f} | "
-              f"Tie: {tie}")
+        # Optional: log to TensorBoard
+        self.logger.record("metrics/cooperation_rate", coop_rate)
+        self.logger.record("metrics/final_gini", gini)
+        self.logger.record("metrics/winner_score", max_score)
+        self.logger.record("metrics/num_winners", num_winners)
+        self.logger.record("metrics/tie", tie)
 
         # Reset paired actions for next episode
-        env.paired_actions = []
-
-
+        self.env_ref.paired_actions = []
+        
 def train_marl(
     num_timesteps=500_000,
     num_chickens=6,
