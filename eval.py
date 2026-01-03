@@ -1,38 +1,102 @@
 import json
 import os
+import random
+from collections import defaultdict
 
-from ray.rllib.algorithms.callbacks import DefaultCallbacks
-from ray.rllib.env.base_env import BaseEnv
-from ray.rllib.evaluation.episode import Episode
-from ray.rllib.evaluation.postprocessing import Postprocessing
-from ray.rllib.policy import Policy
-from ray.rllib.utils.typing import AgentID
+import gymnasium as gym
+import numpy as np
+import torch as th
+from pettingzoo.utils import parallel_to_aec
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import VecMonitor, DummyVecEnv
+from supersuit import pad_observations_v0, pad_action_space_v0
 
+# Assuming your environment class is in a file called chicks.py
 from chicks import NiceChickens
 
 
-class NiceChickensCallback(DefaultCallbacks):
-    def on_episode_end(
-        self,
-        *,
-        worker,
-        base_env: BaseEnv,
-        policies: dict[Policy],
-        episode: Episode,
-        env_index: int,
-        **kwargs
-    ):
+class NiceChickensWrapper(gym.Env):
+    """
+    Wrapper to convert PettingZoo ParallelEnv → single-agent Gym env compatible with SB3.
+    Uses AEC order and concatenates observations for vectorized input.
+    """
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        self.possible_agents = env.possible_agents
+        self.agents = env.agents
 
-        # Actual PettingZoo env
-        env = base_env.get_sub_environments()[env_index]
+        # Observation space: concatenated tuple (scores + res_occ) for all agents
+        single_obs_space = env.observation_space(self.agents[0])
+        self.single_obs_space = gym.spaces.flatten_space(single_obs_space)
+        self.observation_space = gym.spaces.Box(
+            low=np.tile(self.single_obs_space.low, len(self.agents)),
+            high=np.tile(self.single_obs_space.high, len(self.agents)),
+            dtype=np.float32,
+        )
 
-        final_scores = list(env.scores.values())
+        # Action space: multi-discrete (one discrete(2) per agent)
+        self.action_space = gym.spaces.MultiDiscrete([2] * len(self.agents))
 
-        paired_actions = episode.user_data.get("paired_actions", [])
-        if paired_actions:
-            coop_rate = sum(a == 0 for a in paired_actions) / len(paired_actions)
-        else:
-            coop_rate = 0.0
+        self.current_agent_idx = 0
+
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            th.manual_seed(seed)
+
+        observations, infos = self.env.reset(seed=seed)
+        self.agents = self.env.agents
+        self.paired_actions = []  # for cooperation rate tracking
+        return self._get_concat_obs(observations), infos
+
+    def step(self, actions):
+        # actions is np.array of shape (num_agents,)
+        action_dict = {agent: int(actions[i]) for i, agent in enumerate(self.agents)}
+
+        observations, rewards, terminations, truncations, infos = self.env.step(action_dict)
+
+        # Collect paired actions for metric
+        paired_this_step = []
+        for occ in self.env.resource_occupants.values():
+            if len(occ) == 2:
+                a1, a2 = occ
+                act1 = action_dict.get(a1)
+                act2 = action_dict.get(a2)
+                if act1 is not None and act2 is not None:
+                    paired_this_step.extend([act1, act2])
+        self.paired_actions.extend(paired_this_step)
+
+        done = all(terminations.values()) or all(truncations.values())
+        reward = np.mean(list(rewards.values()))  # scalar reward signal (shared policy)
+
+        return self._get_concat_obs(observations), reward, done, False, infos
+
+    def _get_concat_obs(self, obs_dict):
+        if not obs_dict:  # episode over
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        return np.concatenate([gym.spaces.flatten(self.single_obs_space, obs_dict[agent]) for agent in self.agents])
+
+
+class MetricsCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.metrics_log = []
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # Extract info from last episode(s) - SB3 VecEnv stores infos in self.locals['infos']
+        infos = self.locals.get("infos", [{}])
+        info = infos[-1] if infos else {}
+
+        env = self.training_env.envs[0].env.env  # unwrap to our wrapper
+
+        final_scores = list(env.env.scores.values())
+        coop_rate = (sum(a == 0 for a in env.paired_actions) / len(env.paired_actions)) if env.paired_actions else 0.0
 
         scores_sorted = sorted(final_scores)
         n = len(scores_sorted)
@@ -42,40 +106,35 @@ class NiceChickensCallback(DefaultCallbacks):
         else:
             gini = 0.0
 
-        max_score = max(final_scores)
-        num_winners = sum(1 for s in final_scores if s >= env.smax)
+        max_score = max(final_scores) if final_scores else 0.0
+        num_winners = sum(1 for s in final_scores if s >= env.env.smax)
+        tie = 1 if num_winners > 1 else 0
 
-        episode.custom_metrics["cooperation_rate"] = coop_rate
-        episode.custom_metrics["final_gini"] = gini
-        episode.custom_metrics["winner_score"] = max_score
-        episode.custom_metrics["num_winners"] = num_winners
-        episode.custom_metrics["tie"] = 1 if num_winners > 1 else 0
+        metrics = {
+            "episode_reward_mean": self.logger.name_to_value.get("train/episode_reward", 0.0),
+            "episode_len": self.num_timesteps,  # approximate
+            "cooperation_rate": coop_rate,
+            "final_gini": gini,
+            "winner_score": max_score,
+            "num_winners": num_winners,
+            "tie": tie,
+        }
 
-    def on_episode_step(
-        self,
-        *,
-        worker,
-        base_env: BaseEnv,
-        episode: Episode,
-        env_index: int,
-        **kwargs
-    ):
-        env = base_env.get_sub_environments()[env_index]
-        actions = episode.last_info_for().get("actions", {})
-        paired_this_step = []
-        for occ in env.resource_occupants.values():
-            if len(occ) == 2:
-                a1, a2 = occ
-                act1, act2 = actions.get(a1), actions.get(a2)
-                if act1 is not None and act2 is not None:
-                    paired_this_step.extend([act1, act2])
-        if "paired_actions" not in episode.user_data:
-            episode.user_data["paired_actions"] = []
-        episode.user_data["paired_actions"].extend(paired_this_step)
+        self.metrics_log.append(metrics)
+
+        print(f"Rollout end | "
+              f"Reward: {metrics['episode_reward_mean']:.2f} | "
+              f"Coop rate: {coop_rate:.3f} | "
+              f"Gini: {gini:.3f} | "
+              f"Winner score: {max_score:.1f} | "
+              f"Tie: {tie}")
+
+        # Reset paired actions for next episode
+        env.paired_actions = []
+
 
 def train_marl(
-    num_iterations=100,
-    num_env_runners=4,
+    num_timesteps=500_000,
     num_chickens=6,
     smax=100.0,
     v=10.0,
@@ -84,84 +143,75 @@ def train_marl(
     beta1=1.0,
     beta2=1.0,
     empathy_as_reward=False,
-    wandb_project="NiceChickens",
-    checkpoint_dir="./checkpoints"
+    log_dir="./sb3_logs",
+    checkpoint_dir="./sb3_checkpoints",
 ):
-    def env_creator(_):
-        return ParallelPettingZooEnv(
-            NiceChickens(
-                num_chickens=num_chickens,
-                smax=smax,
-                v=v,
-                c=c,
-                alpha=alpha,
-                beta1=beta1,
-                beta2=beta2,
-                empathy_as_reward=empathy_as_reward
-            )
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def make_env():
+        parallel_env = NiceChickens(
+            num_chickens=num_chickens,
+            smax=smax,
+            v=v,
+            c=c,
+            alpha=alpha,
+            beta1=beta1,
+            beta2=beta2,
+            empathy_as_reward=empathy_as_reward,
         )
+        aec_env = parallel_to_aec(parallel_env)
+        # Optional padding if needed (helps with variable agents, but usually not necessary here)
+        aec_env = pad_observations_v0(aec_env)
+        aec_env = pad_action_space_v0(aec_env)
+        wrapped = NiceChickensWrapper(aec_env)
+        return wrapped
 
-        register_env("NiceChickens", env_creator)
+    vec_env = DummyVecEnv([make_env])
+    vec_env = VecMonitor(vec_env, filename=os.path.join(log_dir, "monitor.csv"))
 
-        if wandb_project:
-            wandb.init(project=wandb_project, config=locals())
+    policy_kwargs = dict(activation_fn=th.nn.Tanh, net_arch=[256, 256])
 
-        config = (
-            PPOConfig()
-            .environment("NiceChickens")
-            .env_runners(num_env_runners=num_env_runners, rollout_fragment_length=100)
-            .training(lr=3e-4, train_batch_size=4000)
-            .multi_agent(
-                policies={"shared_policy": (None, None, None, {})},
-                policy_mapping_fn=lambda agent_id, *args, **kwargs: "shared_policy"
-            )
-            .callbacks(NiceChickensCallback)
-            .framework("torch")
-        )
+    model = PPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=1,
+        learning_rate=3e-4,
+        batch_size=256,
+        n_steps=2048,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        policy_kwargs=policy_kwargs,
+        tensorboard_log=log_dir,
+    )
 
-        algo = config.build()
+    callback = MetricsCallback()
 
-        log_file = os.path.join(checkpoint_dir, "training_metrics.json")
-        training_log = []
+    model.learn(total_timesteps=num_timesteps, callback=callback)
 
-        for i in range(num_iterations):
-            result = algo.train()
-            print(f"Iter {i+1}/{num_iterations}:")
-            print(f"  Reward: {result['episode_reward_mean']:.2f}")
-            print(f"  Length: {result['episode_len_mean']:.1f}")
-            print(f"  Coop rate: {result['custom_metrics']['cooperation_rate_mean']:.3f}")
-            print(f"  Gini: {result['custom_metrics']['final_gini_mean']:.3f}")
-            print(f"  Winner score: {result['custom_metrics']['winner_score_mean']:.1f}")
-            print(f"  Tie rate: {result['custom_metrics']['tie_mean']:.3f}")
+    # Save model
+    model_path = os.path.join(checkpoint_dir, "final_model")
+    model.save(model_path)
+    print(f"Model saved to {model_path}")
 
-            training_log.append({
-                "iteration": i + 1,
-                "episode_reward_mean": result['episode_reward_mean'],
-                "episode_len_mean": result['episode_len_mean'],
-                "cooperation_rate": result['custom_metrics']['cooperation_rate_mean'],
-                "final_gini": result['custom_metrics']['final_gini_mean'],
-                "winner_score": result['custom_metrics']['winner_score_mean'],
-                "tie_rate": result['custom_metrics']['tie_mean'],
-            })
+    # Save custom metrics
+    metrics_path = os.path.join(log_dir, "training_metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(callback.metrics_log, f, indent=2)
+    print(f"Training metrics saved to {metrics_path}")
 
-            if wandb_project:
-                wandb.log({
-                    "episode_reward_mean": result['episode_reward_mean'],
-                    "episode_len_mean": result['episode_len_mean'],
-                    "cooperation_rate": result['custom_metrics']['cooperation_rate_mean'],
-                    "final_gini": result['custom_metrics']['final_gini_mean'],
-                    "winner_score": result['custom_metrics']['winner_score_mean'],
-                    "tie_rate": result['custom_metrics']['tie_mean'],
-                    "iteration": i + 1
-                })
 
-        checkpoint = algo.save(checkpoint_dir)
-        print(f"Checkpoint saved: {checkpoint}")
-
-        with open(log_file, "w") as f:
-            json.dump(training_log, f, indent=2)
-        print(f"Training metrics saved to {log_file}")
-        
-        algo.stop()
-        ray.shutdown()
-
+if __name__ == "__main__":
+    train_marl(
+        num_timesteps=1_000_000,
+        num_chickens=6,
+        smax=100.0,
+        v=10.0,
+        c=2.0,
+        alpha=1.0,
+        beta1=1.0,
+        beta2=1.0,
+        empathy_as_reward=False,
+    )
