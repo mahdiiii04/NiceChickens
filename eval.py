@@ -85,24 +85,27 @@ class NiceChickensWrapper(gym.Env):
 class MetricsCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self.paired_actions_history = []  # We'll collect across episodes
-        self.env_ref = None  # Will store reference to our wrapped env
+        self.env_ref = None  # Will hold reference to our wrapper
 
     def _on_training_start(self) -> None:
-        # Grab the environment once at the start of training
-        self.env_ref = self.training_env.envs[0]  # This is our NiceChickensWrapper
+        # Capture the environment at the very start of training
+        self.env_ref = self.training_env.envs[0]  # NiceChickensWrapper instance
+
+    def _on_step(self) -> bool:
+        # Required abstract method — we don't need it, but must return True to continue training
+        return True
 
     def _on_rollout_end(self) -> None:
         if self.env_ref is None:
             return
 
-        # Access the original NiceChickens env
-        env = self.env_ref.env  # → NiceChickens instance
+        # Access the original PettingZoo env
+        env = self.env_ref.env  # This is your NiceChickens instance
 
         final_scores = list(env.scores.values())
 
-        # Get paired actions from the wrapper (we stored them there)
-        paired_actions = self.env_ref.paired_actions if hasattr(self.env_ref, 'paired_actions') else []
+        # Get cooperation actions collected during the episode
+        paired_actions = getattr(self.env_ref, "paired_actions", [])
         coop_rate = (sum(a == 0 for a in paired_actions) / len(paired_actions)) if paired_actions else 0.0
 
         # Gini coefficient
@@ -118,24 +121,25 @@ class MetricsCallback(BaseCallback):
         num_winners = sum(1 for s in final_scores if s >= env.smax)
         tie = 1 if num_winners > 1 else 0
 
-        print(f"\n=== Rollout Metrics ===")
+        print(f"\n=== Episode Metrics ===")
         print(f"Cooperation rate: {coop_rate:.3f}")
         print(f"Gini coefficient: {gini:.3f}")
-        print(f"Max score: {max_score:.1f}")
-        print(f"Num winners: {num_winners} | Tie: {tie}")
-        print(f"Episode reward mean (approx): {self.logger.name_to_value.get('train/episode_reward', 0):.2f}")
-        print("="*30)
+        print(f"Max score (winner): {max_score:.1f}")
+        print(f"Number of winners: {num_winners} | Tie: {int(tie)}")
+        print(f"Steps so far: {self.num_timesteps}")
+        print("=" * 40)
 
-        # Optional: log to TensorBoard
-        self.logger.record("metrics/cooperation_rate", coop_rate)
-        self.logger.record("metrics/final_gini", gini)
-        self.logger.record("metrics/winner_score", max_score)
-        self.logger.record("metrics/num_winners", num_winners)
-        self.logger.record("metrics/tie", tie)
+        # Log to TensorBoard (if you're using it)
+        if self.logger:
+            self.logger.record("metrics/cooperation_rate", coop_rate)
+            self.logger.record("metrics/final_gini", gini)
+            self.logger.record("metrics/winner_score", max_score)
+            self.logger.record("metrics/num_winners", num_winners)
+            self.logger.record("metrics/tie", tie)
 
-        # Reset paired actions for next episode
+        # Reset for next episode
         self.env_ref.paired_actions = []
-        
+                
 def train_marl(
     num_timesteps=500_000,
     num_chickens=6,
