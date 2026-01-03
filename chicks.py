@@ -62,12 +62,13 @@ class NiceChickens(ParallelEnv):
         
         res_occ = np.array([self_norm_idx, opp_norm_idx], dtype=np.float32)
             
-        return (scores, res_occ)
+        return np.concatenate([scores, res_occ])
     
     def observation_space(self, agent):
-        return spaces.Tuple(
-            spaces.Box(low=0.0, high=1.0, shape=(self._num_chickens,), dtype=np.float32),
-            spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        return spaces.Box(
+            low=np.array([0.0] * self._num_chickens + [-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0] * self._num_chickens + [1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
         )
     
     def action_space(self, agent):

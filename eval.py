@@ -15,70 +15,76 @@ from supersuit import pad_observations_v0, pad_action_space_v0
 # Assuming your environment class is in a file called chicks.py
 from chicks import NiceChickens
 
+def make_env():
+    parallel_env = NiceChickens(
+        num_chickens=num_chickens,
+        smax=smax,
+        v=v,
+        c=c,
+        alpha=alpha,
+        beta1=beta1,
+        beta2=beta2,
+        empathy_as_reward=empathy_as_reward,
+    )
+    # No need for parallel_to_aec or padding anymore
+    # Directly wrap the ParallelEnv
+    wrapped = NiceChickensWrapper(parallel_env)
+    return wrapped
 
 class NiceChickensWrapper(gym.Env):
-    """
-    Wrapper to convert PettingZoo ParallelEnv → single-agent Gym env compatible with SB3.
-    Uses AEC order and concatenates observations for vectorized input.
-    """
     def __init__(self, env):
         super().__init__()
         self.env = env
         self.possible_agents = env.possible_agents
         self.agents = env.agents
 
-        # Observation space: concatenated tuple (scores + res_occ) for all agents
-        single_obs_space = env.observation_space(self.agents[0])
-        self.single_obs_space = gym.spaces.flatten_space(single_obs_space)
-        self.observation_space = gym.spaces.Box(
-            low=np.tile(self.single_obs_space.low, len(self.agents)),
-            high=np.tile(self.single_obs_space.high, len(self.agents)),
+        # Single flat observation space
+        single_obs_space = env.observation_space(env.agents[0])
+        self.observation_space = spaces.Box(
+            low=np.tile(single_obs_space.low, len(self.agents)),
+            high=np.tile(single_obs_space.high, len(self.agents)),
             dtype=np.float32,
         )
 
-        # Action space: multi-discrete (one discrete(2) per agent)
-        self.action_space = gym.spaces.MultiDiscrete([2] * len(self.agents))
+        # MultiDiscrete action space (one Discrete(2) per agent)
+        self.action_space = spaces.MultiDiscrete([2] * len(self.agents))
 
-        self.current_agent_idx = 0
+        self.paired_actions = []
 
     def reset(self, seed=None, options=None):
         if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            th.manual_seed(seed)
-
-        observations, infos = self.env.reset(seed=seed)
+            self.env.reset(seed=seed)
+        else:
+            self.env.reset()
         self.agents = self.env.agents
-        self.paired_actions = []  # for cooperation rate tracking
+        self.paired_actions = []
+        observations, infos = self.env.reset() if seed is None else self.env.reset(seed=seed)
+        # reset returns obs, info — but in your code it's already handled
         return self._get_concat_obs(observations), infos
 
-    def step(self, actions):
-        # actions is np.array of shape (num_agents,)
+    def step(self, actions):  # actions: np.array of shape (num_agents,)
         action_dict = {agent: int(actions[i]) for i, agent in enumerate(self.agents)}
-
         observations, rewards, terminations, truncations, infos = self.env.step(action_dict)
 
-        # Collect paired actions for metric
+        # Track paired actions for metrics
         paired_this_step = []
         for occ in self.env.resource_occupants.values():
             if len(occ) == 2:
                 a1, a2 = occ
-                act1 = action_dict.get(a1)
-                act2 = action_dict.get(a2)
+                act1, act2 = action_dict.get(a1), action_dict.get(a2)
                 if act1 is not None and act2 is not None:
                     paired_this_step.extend([act1, act2])
         self.paired_actions.extend(paired_this_step)
 
         done = all(terminations.values()) or all(truncations.values())
-        reward = np.mean(list(rewards.values()))  # scalar reward signal (shared policy)
+        reward = np.mean(list(rewards.values()))  # shared policy → average reward
 
         return self._get_concat_obs(observations), reward, done, False, infos
 
     def _get_concat_obs(self, obs_dict):
-        if not obs_dict:  # episode over
+        if not obs_dict:
             return np.zeros(self.observation_space.shape, dtype=np.float32)
-        return np.concatenate([gym.spaces.flatten(self.single_obs_space, obs_dict[agent]) for agent in self.agents])
-
+        return np.concatenate([obs_dict[agent] for agent in self.agents])
 
 class MetricsCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -160,11 +166,9 @@ def train_marl(
             beta2=beta2,
             empathy_as_reward=empathy_as_reward,
         )
-        aec_env = parallel_to_aec(parallel_env)
-        # Optional padding if needed (helps with variable agents, but usually not necessary here)
-        aec_env = pad_observations_v0(aec_env)
-        aec_env = pad_action_space_v0(aec_env)
-        wrapped = NiceChickensWrapper(aec_env)
+        # No need for parallel_to_aec or padding anymore
+        # Directly wrap the ParallelEnv
+        wrapped = NiceChickensWrapper(parallel_env)
         return wrapped
 
     vec_env = DummyVecEnv([make_env])
