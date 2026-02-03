@@ -13,7 +13,6 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecMonitor, DummyVecEnv
 from supersuit import pad_observations_v0, pad_action_space_v0
 
-# Assuming your environment class is in a file called chicks.py
 from chicks import NiceChickens
 
 def make_env():
@@ -27,8 +26,7 @@ def make_env():
         beta2=beta2,
         empathy_as_reward=empathy_as_reward,
     )
-    # No need for parallel_to_aec or padding anymore
-    # Directly wrap the ParallelEnv
+
     wrapped = NiceChickensWrapper(parallel_env)
     return wrapped
 
@@ -39,7 +37,6 @@ class NiceChickensWrapper(gym.Env):
         self.possible_agents = env.possible_agents
         self.agents = env.agents
 
-        # Single flat observation space
         single_obs_space = env.observation_space(env.agents[0])
         self.observation_space = spaces.Box(
             low=np.tile(single_obs_space.low, len(self.agents)),
@@ -47,7 +44,6 @@ class NiceChickensWrapper(gym.Env):
             dtype=np.float32,
         )
 
-        # MultiDiscrete action space (one Discrete(2) per agent)
         self.action_space = spaces.MultiDiscrete([2] * len(self.agents))
 
         self.paired_actions = []
@@ -55,14 +51,13 @@ class NiceChickensWrapper(gym.Env):
     def reset(self, seed=None, options=None):
         observations, infos = self.env.reset(seed=seed)
         self.agents = self.env.agents
-        self.paired_actions = []  # <-- Critical: reset here!
+        self.paired_actions = []  
         return self._get_concat_obs(observations), infos
 
-    def step(self, actions):  # actions: np.array of shape (num_agents,)
+    def step(self, actions): 
         action_dict = {agent: int(actions[i]) for i, agent in enumerate(self.agents)}
         observations, rewards, terminations, truncations, infos = self.env.step(action_dict)
 
-        # Track paired actions for metrics
         paired_this_step = []
         for occ in self.env.resource_occupants.values():
             if len(occ) == 2:
@@ -73,7 +68,7 @@ class NiceChickensWrapper(gym.Env):
         self.paired_actions.extend(paired_this_step)
 
         done = all(terminations.values()) or all(truncations.values())
-        reward = np.mean(list(rewards.values()))  # shared policy → average reward
+        reward = np.mean(list(rewards.values()))  
 
         return self._get_concat_obs(observations), reward, done, False, infos
 
@@ -86,10 +81,10 @@ class MetricsCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.env_ref = None
-        self.metrics_log = []  # ← Re-added to collect history for JSON save
+        self.metrics_log = [] 
 
     def _on_training_start(self) -> None:
-        self.env_ref = self.training_env.envs[0]  # NiceChickensWrapper
+        self.env_ref = self.training_env.envs[0]  
 
     def _on_step(self) -> bool:
         return True
@@ -98,7 +93,7 @@ class MetricsCallback(BaseCallback):
         if self.env_ref is None:
             return
 
-        env = self.env_ref.env  # Original NiceChickens
+        env = self.env_ref.env 
 
         final_scores = list(env.scores.values())
         paired_actions = getattr(self.env_ref, "paired_actions", [])
@@ -116,7 +111,6 @@ class MetricsCallback(BaseCallback):
         num_winners = sum(1 for s in final_scores if s >= env.smax)
         tie = 1 if num_winners > 1 else 0
 
-        # Approximate episode reward from SB3 logger
         episode_reward = self.logger.name_to_value.get("train/episode_reward", 0.0) if self.logger else 0.0
 
         metrics = {
@@ -139,7 +133,6 @@ class MetricsCallback(BaseCallback):
         print(f"Episode reward (avg): {episode_reward:.2f}")
         print("=" * 50)
 
-        # TensorBoard logging
         if self.logger:
             self.logger.record("metrics/cooperation_rate", coop_rate)
             self.logger.record("metrics/final_gini", gini)
@@ -147,7 +140,6 @@ class MetricsCallback(BaseCallback):
             self.logger.record("metrics/num_winners", num_winners)
             self.logger.record("metrics/tie", tie)
 
-        # Reset for next episode
         self.env_ref.paired_actions = []
         
 def train_marl(
@@ -177,8 +169,7 @@ def train_marl(
             beta2=beta2,
             empathy_as_reward=empathy_as_reward,
         )
-        # No need for parallel_to_aec or padding anymore
-        # Directly wrap the ParallelEnv
+  
         wrapped = NiceChickensWrapper(parallel_env)
         return wrapped
 
@@ -206,12 +197,10 @@ def train_marl(
 
     model.learn(total_timesteps=num_timesteps, callback=callback)
 
-    # Save model
     model_path = os.path.join(checkpoint_dir, "final_model")
     model.save(model_path)
     print(f"Model saved to {model_path}")
 
-    # Save custom metrics
     metrics_path = os.path.join(log_dir, "training_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(callback.metrics_log, f, indent=2)
